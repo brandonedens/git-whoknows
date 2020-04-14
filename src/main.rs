@@ -1,8 +1,12 @@
-use anyhow::Result;
-use git2::{BlameHunk, BlameOptions, Oid, Repository, Signature};
-use std::collections::HashMap;
+#[macro_use]
+extern crate nom;
+
+mod blame;
+
+use anyhow::{Context, Result};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use structopt::clap::AppSettings;
 use structopt::StructOpt;
 
@@ -23,49 +27,80 @@ struct Args {
     flag_F: bool,
 }
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Author {
+    name: String,
+    mail: String,
+}
+
+impl Author {
+    fn new(name: &str, mail: &str) -> Self {
+        Author {
+            name: name.to_string(),
+            mail: mail.to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Commit {
+    hash: String,
+    author: String,
+    author_mail: String,
+    num_lines: usize,
+}
+
 struct TrackedFile {
     #[allow(dead_code)]
-    path: String,
-    owners: HashMap<String, Owner>,
+    path: PathBuf,
+    commits: Vec<Commit>,
 }
 
 impl TrackedFile {
-    fn new(path: &String) -> TrackedFile {
-        TrackedFile {
-            path: path.clone(),
-            owners: HashMap::new(),
-        }
-    }
+    fn from_path(path: &Path) -> Result<Self> {
+        // Generate blame.
+        let txt = blame::generate_blame(&path)?;
+        let lines = blame::parse_blame(&txt);
 
-    fn add_hunk(&mut self, commit: &BlameHunk) {
-        let owner = Owner::new(&commit.final_signature());
-        self.owners
-            .entry(owner.email.clone())
-            .or_insert(owner)
-            .add_hunk(commit);
+        let mut commits: HashMap<String, Commit> = HashMap::new();
+        lines.iter().for_each(|line| {
+            if let Some(extra) = &line.header.extra {
+                // We only see extra header details each time we encounter a new commit.
+                commits.insert(
+                    line.header.hash.to_string(),
+                    Commit {
+                        hash: line.header.hash.to_string(),
+                        author: extra.author.to_string(),
+                        author_mail: extra.author_mail.to_string(),
+                        num_lines: 0,
+                    },
+                );
+            }
+
+            if let Some(commit) = commits.get_mut(line.header.hash) {
+                commit.num_lines += 1;
+            } else {
+                unreachable!();
+            }
+        });
+
+        let commits = commits.into_iter().map(|(_, v)| v).collect();
+        Ok(TrackedFile {
+            path: path.to_owned(),
+            commits,
+        })
     }
 }
 
-struct Owner {
-    #[allow(dead_code)]
-    name: String,
-    email: String,
-    commits: HashMap<Oid, usize>,
-}
-
-impl Owner {
-    fn new(sig: &Signature) -> Owner {
-        let email = String::from_utf8_lossy(sig.email_bytes()).to_string();
-        let name = String::from_utf8_lossy(sig.name_bytes()).to_string();
-        Owner {
-            name,
-            email,
-            commits: HashMap::new(),
+/*
+impl Author {
+    fn from_blame_header(header: &blame::Header) {
+        Author {
+            name: header.author.to_string(),
+            mail: header.author_mail.to_string(),
+            commits: Vec::new(),
+            lines: Vec::new(),
         }
-    }
-
-    fn add_hunk(&mut self, commit: &BlameHunk) {
-        *self.commits.entry(commit.final_commit_id()).or_insert(0) += commit.lines_in_hunk();
     }
 
     fn lines(&self) -> usize {
@@ -73,7 +108,7 @@ impl Owner {
     }
 }
 
-impl fmt::Display for Owner {
+impl fmt::Display for Author {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
@@ -85,43 +120,43 @@ impl fmt::Display for Owner {
         )
     }
 }
+*/
 
 fn main() -> Result<()> {
     let args = Args::from_args();
 
-    //let path = Path::new(&args.arg_path[..]);
-    let repo = Repository::discover(&args.arg_path)?;
+    let path = args.arg_path.canonicalize()?;
 
-    // Construct the path relative to the Git repository.
-    let repo_base_path = repo.path().parent().unwrap();
-    let arg_path = args.arg_path.canonicalize()?;
-    let path = if repo_base_path == arg_path {
-        repo_base_path
-    } else {
-        arg_path.strip_prefix(repo_base_path)?
-    };
+    let tracked_file = TrackedFile::from_path(&path).context(format!(
+        "Failure to generate blame details for: {}",
+        path.display()
+    ))?;
 
-    // Prepare our blame options
-    let mut opts = BlameOptions::new();
-    opts.track_copies_same_commit_moves(args.flag_M)
-        .track_copies_same_commit_copies(args.flag_C)
-        .first_parent(args.flag_F);
+    let mut author_commits: HashMap<Author, Vec<Commit>> = HashMap::new();
+    tracked_file.commits.into_iter().for_each(|commit| {
+        let author = Author::new(&commit.author, &commit.author_mail);
+        author_commits.entry(author).or_default().push(commit);
+    });
+    let mut author_commits: Vec<(usize, Author, Vec<Commit>)> = author_commits
+        .into_iter()
+        .map(|(author, commits)| {
+            let num_lines = commits.iter().map(|commit| commit.num_lines).sum();
+            (num_lines, author, commits)
+        })
+        .collect();
+    author_commits.sort_by(|a, b| b.0.cmp(&a.0));
 
-    let mut tracker = TrackedFile::new(&path.display().to_string());
+    println!("File: {}", tracked_file.path.display());
 
-    let blame = repo.blame_file(path, Some(&mut opts))?;
-
-    for hunk in blame.iter() {
-        tracker.add_hunk(&hunk);
-    }
-
-    println!("File: {}", tracker.path);
-    let mut owners: Vec<&Owner> = tracker.owners.values().collect();
-    owners.sort_by(|a, b| b.lines().cmp(&a.lines()));
-
-    for owner in owners {
-        println!("  {}", owner);
-    }
+    author_commits.iter().for_each(|(lines, author, commits)| {
+        println!(
+            "  {} {}: Lines: {} Count: {}",
+            author.name,
+            author.mail,
+            lines,
+            commits.len()
+        );
+    });
 
     Ok(())
 }
